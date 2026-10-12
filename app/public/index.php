@@ -2,43 +2,124 @@
 
 declare(strict_types=1);
 
+use App\Eloquent;
+use App\LoggerFactory;
+use App\Model\Demo;
+
+ob_start();
+
 require __DIR__ . '/../vendor/autoload.php';
 
-use App\Database;
+$logger = LoggerFactory::create();
+$requestStartedAt = microtime(true);
 
-// Обработка формы добавления записи. Редиректим после POST (Post/Redirect/Get),
-// чтобы повторная отправка формы не происходила при обновлении страницы
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['note'])) {
-    try {
-        $pdo = Database::connect();
-        $stmt = $pdo->prepare('INSERT INTO demo (note) VALUES (:note)');
-        $stmt->execute(['note' => (string) $_POST['note']]);
-    } catch (\Throwable $e) {
-        // Ошибка подключения/записи — статус БД и так будет виден на странице ниже
+// Выполняется и при exit после редиректа, и при обычном завершении.
+register_shutdown_function(
+    static function () use ($logger, $requestStartedAt): void {
+        $body = ob_get_contents();
+
+        if ($body === false) {
+            $body = '';
+        }
+
+        $statusCode = http_response_code();
+
+        if (!is_int($statusCode)) {
+            $statusCode = 200;
+        }
+
+        if ($logger !== null) {
+            try {
+                $logger->info('HTTP request completed', [
+                    'method' => $_SERVER['REQUEST_METHOD'] ?? 'UNKNOWN',
+                    'uri' => $_SERVER['REQUEST_URI'] ?? '/',
+                    'status' => $statusCode,
+                    'duration_ms' => round(
+                        (microtime(true) - $requestStartedAt) * 1000,
+                        2
+                    ),
+                    'response_body' => $body,
+                ]);
+            } catch (Throwable) {
+                // Ошибка записи в лог не должна ломать HTTP-ответ.
+            }
+        }
+
+        if (ob_get_level() > 0) {
+            ob_end_flush();
+        }
     }
-    header('Location: /');
+);
+
+/**
+ * Экранирует текст перед выводом в HTML.
+ */
+function h(string $value): string
+{
+    return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
+}
+
+// Обработка формы с сохранением Post/Redirect/Get.
+if (
+    ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST'
+    && isset($_POST['note'])
+) {
+    try {
+        Eloquent::boot();
+
+        Demo::query()->create([
+            'note' => (string) $_POST['note'],
+        ]);
+    } catch (Throwable $e) {
+        if ($logger !== null) {
+            try {
+                $logger->error('Failed to insert demo record', [
+                    'exception' => $e::class,
+                    'message' => $e->getMessage(),
+                ]);
+            } catch (Throwable) {
+                // Не прерываем обработку запроса из-за логирования.
+            }
+        }
+    }
+
+    header('Location: /', true, 302);
     exit;
 }
 
 $phpVersion = PHP_VERSION;
 $hasPdoPgsql = extension_loaded('pdo_pgsql');
-$hostname = gethostname();
+$hostname = gethostname() ?: 'unknown';
 
 $dbVersion = null;
 $dbError = null;
 $rows = [];
 
 try {
-    $pdo = Database::connect();
-    $dbVersion = (string) $pdo->query('SELECT version()')->fetchColumn();
-    $rows = $pdo->query('SELECT id, created_at, note FROM demo ORDER BY id DESC')->fetchAll();
-} catch (\Throwable $e) {
-    $dbError = $e->getMessage();
-}
+    Eloquent::boot();
 
-function h(string $value): string
-{
-    return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
+    $connection = Eloquent::boot()->getConnection();
+
+    $version = $connection->selectOne('SELECT version() AS version');
+    $dbVersion = (string) $version->version;
+
+    $rows = Demo::query()
+        ->orderByDesc('id')
+        ->get(['id', 'created_at', 'note'])
+        ->toArray();
+} catch (Throwable $e) {
+    $dbError = $e->getMessage();
+
+    if ($logger !== null) {
+        try {
+            $logger->error('Failed to load demo records', [
+                'exception' => $e::class,
+                'message' => $e->getMessage(),
+            ]);
+        } catch (Throwable) {
+            // Страница сможет отобразить ошибку БД.
+        }
+    }
 }
 ?>
 <!DOCTYPE html>
@@ -48,20 +129,54 @@ function h(string $value): string
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>nginx + php-fpm + PostgreSQL</title>
     <style>
-        body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #1c1c1c; }
+        body {
+            font-family: system-ui, sans-serif;
+            max-width: 720px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+            color: #1c1c1c;
+        }
         h1 { font-size: 1.4rem; }
         h2 { font-size: 1.1rem; margin-top: 2rem; }
-        dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; background: #f6f6f6; padding: 1rem; border-radius: 6px; }
+        dl {
+            display: grid;
+            grid-template-columns: max-content 1fr;
+            gap: 0.3rem 1rem;
+            background: #f6f6f6;
+            padding: 1rem;
+            border-radius: 6px;
+        }
         dt { font-weight: 600; }
         dd { margin: 0; }
         .ok { color: #0a7a2f; }
         .fail { color: #b00020; }
-        table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1rem; }
-        th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; text-align: left; font-size: 0.9rem; }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 0.5rem 0 1rem;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 0.4rem 0.6rem;
+            text-align: left;
+            font-size: 0.9rem;
+        }
         th { background: #f0f0f0; }
         form { display: flex; gap: 0.5rem; }
-        input[type=text] { flex: 1; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; }
-        button { padding: 0.5rem 1.2rem; border: 0; border-radius: 4px; background: #2563eb; color: #fff; cursor: pointer; }
+        input[type=text] {
+            flex: 1;
+            padding: 0.5rem;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        button {
+            padding: 0.5rem 1.2rem;
+            border: 0;
+            border-radius: 4px;
+            background: #2563eb;
+            color: #fff;
+            cursor: pointer;
+        }
         button:hover { background: #1d4ed8; }
     </style>
 </head>
@@ -73,21 +188,30 @@ function h(string $value): string
         <dd><?= h($phpVersion) ?></dd>
 
         <dt>Расширение pdo_pgsql</dt>
-        <dd class="<?= $hasPdoPgsql ? 'ok' : 'fail' ?>"><?= $hasPdoPgsql ? 'подключено' : 'отсутствует' ?></dd>
+        <dd class="<?= $hasPdoPgsql ? 'ok' : 'fail' ?>">
+            <?= $hasPdoPgsql ? 'подключено' : 'отсутствует' ?>
+        </dd>
 
         <dt>Хост контейнера</dt>
-        <dd><?= h((string) $hostname) ?></dd>
+        <dd><?= h($hostname) ?></dd>
 
         <dt>Подключение к БД</dt>
         <dd class="<?= $dbError === null ? 'ok' : 'fail' ?>">
-            <?= $dbError === null ? h($dbVersion ?? '') : 'ошибка: ' . h($dbError) ?>
+            <?= $dbError === null
+                ? h($dbVersion ?? '')
+                : 'ошибка: ' . h($dbError) ?>
         </dd>
     </dl>
 
     <h2>Таблица demo</h2>
+
     <?php if ($rows): ?>
         <table>
-            <tr><th>id</th><th>создано</th><th>note</th></tr>
+            <tr>
+                <th>id</th>
+                <th>создано</th>
+                <th>note</th>
+            </tr>
             <?php foreach ($rows as $row): ?>
                 <tr>
                     <td><?= h((string) $row['id']) ?></td>
@@ -101,7 +225,13 @@ function h(string $value): string
     <?php endif; ?>
 
     <form method="post" action="/">
-        <input type="text" name="note" placeholder="Новая запись" required maxlength="500">
+        <input
+            type="text"
+            name="note"
+            placeholder="Новая запись"
+            required
+            maxlength="500"
+        >
         <button type="submit">Добавить</button>
     </form>
 </body>

@@ -1,2 +1,6 @@
 .env
+.env.*
+!.env.example
+
 app/vendor/
+app/storage/logs/*.log
